@@ -1,0 +1,231 @@
+name: OIR live export cascade
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'probe-trigger/cascade-*'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - run: python -m pip install --disable-pip-version-check --quiet requests beautifulsoup4
+      - name: Reproduce cascading OIR form and submit report
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p probe
+          cat > /tmp/cascade.py <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, traceback
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse
+          import requests
+          from bs4 import BeautifulSoup
+
+          URL = "https://qsrng.floir.gov/reports/ReportCriteria.aspx"
+          OUT = Path("probe")
+          s = requests.Session()
+          s.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          })
+          targets = {
+              "14407": ["heritage", "property", "casualty"],
+              "10861": ["universal", "property", "casualty"],
+              "13563": ["american", "platinum"],
+              "12944": ["homeowners", "choice"],
+              "15885": ["typtap"],
+              "17547": ["core", "insurance"],
+              "17706": ["tailrow"],
+              "12968": ["american", "coastal"],
+          }
+          result = {"url": URL, "targets": list(targets), "stages": [], "errors": [], "candidate_downloads": []}
+
+          def digest(b): return hashlib.sha256(b).hexdigest()
+          def clean(x): return re.sub(r"[^A-Za-z0-9._-]+", "_", x).strip("_")
+
+          def soup(html): return BeautifulSoup(html, "html.parser")
+
+          def form_fields(html):
+              form = soup(html).find("form")
+              if form is None: raise RuntimeError("form missing")
+              out = []
+              for n in form.find_all(["input", "select", "textarea"]):
+                  name = n.get("name")
+                  if not name or n.has_attr("disabled"): continue
+                  if n.name == "input":
+                      typ = (n.get("type") or "text").lower()
+                      if typ in {"submit", "button", "image", "file", "reset"}: continue
+                      if typ in {"radio", "checkbox"} and not n.has_attr("checked"): continue
+                      out.append((name, n.get("value", "")))
+                  elif n.name == "select":
+                      opts = n.find_all("option")
+                      selected = [o for o in opts if o.has_attr("selected")]
+                      if not selected and opts and not n.has_attr("multiple"): selected = [opts[0]]
+                      for o in selected: out.append((name, o.get("value", o.get_text(" ", strip=True))))
+                  else:
+                      out.append((name, n.get_text()))
+              return out
+
+          def options(html, name):
+              node = soup(html).find("select", attrs={"name": name})
+              if node is None: return []
+              return [{"value": o.get("value", o.get_text(" ", strip=True)), "label": o.get_text(" ", strip=True)} for o in node.find_all("option")]
+
+          def inventory(html):
+              sp = soup(html)
+              return {
+                  "title": sp.title.get_text(" ", strip=True) if sp.title else None,
+                  "selects": {
+                      n.get("name", n.get("id", "unknown")): [
+                          {"value": o.get("value", o.get_text(" ", strip=True)), "label": o.get_text(" ", strip=True), "selected": o.has_attr("selected")}
+                          for o in n.find_all("option")
+                      ] for n in sp.find_all("select")
+                  },
+                  "messages": [n.get_text(" ", strip=True) for n in sp.find_all(id=re.compile(r"Validator|Validation|Error|Message", re.I)) if n.get_text(" ", strip=True)],
+              }
+
+          def save(stage, response):
+              body = response.content
+              ctype = response.headers.get("content-type", "")
+              ext = ".xlsx" if body.startswith(b"PK\x03\x04") else (".html" if "html" in ctype.lower() or body.lstrip().startswith(b"<") else ".bin")
+              stem = clean(stage)
+              (OUT / f"{stem}{ext}").write_bytes(body)
+              (OUT / f"{stem}.headers.json").write_text(json.dumps(dict(response.headers), indent=2), encoding="utf-8")
+              rec = {"stage": stage, "status": response.status_code, "url": response.url, "content_type": ctype, "bytes": len(body), "sha256": digest(body), "file": f"{stem}{ext}"}
+              if ext == ".html":
+                  inv = inventory(body)
+                  (OUT / f"{stem}.inventory.json").write_text(json.dumps(inv, indent=2), encoding="utf-8")
+                  rec["inventory_file"] = f"{stem}.inventory.json"
+              result["stages"].append(rec)
+              response.raise_for_status()
+              return body
+
+          def post(stage, html, updates=None, target="", button=None):
+              updates = updates or {}
+              fields = form_fields(html)
+              remove = set(updates) | {"__EVENTTARGET", "__EVENTARGUMENT"}
+              fields = [(k,v) for k,v in fields if k not in remove]
+              for k,v in updates.items():
+                  vals = v if isinstance(v, list) else [v]
+                  fields.extend((k, str(x)) for x in vals)
+              fields += [("__EVENTTARGET", target), ("__EVENTARGUMENT", "")]
+              if button: fields.append(button)
+              r = s.post(URL, files=[(k,(None,v)) for k,v in fields], timeout=180, allow_redirects=True)
+              return save(stage, r)
+
+          def move(stage, html, base, values=None, all_items=False):
+              if all_items:
+                  return post(stage, html, button=(base + "$MoveAllRight", ">>"))
+              if not values: raise RuntimeError(f"no values for {base}")
+              return post(stage, html, {base + "$LeftBox": values}, button=(base + "$MoveRight", ">"))
+
+          def target_matches(rows):
+              matched = {}
+              vals = []
+              for code, frags in targets.items():
+                  hit = None
+                  for row in rows:
+                      text = re.sub(r"[^a-z0-9]+", " ", row["label"].lower())
+                      if code in text or all(f in text for f in frags):
+                          hit = row; break
+                  matched[code] = hit
+                  if hit and hit["value"] not in vals: vals.append(hit["value"])
+              return vals, matched
+
+          def candidate_urls(html, base):
+              sp = soup(html); raw = set()
+              for tag, attr in [("a","href"),("iframe","src"),("frame","src"),("form","action"),("script","src")]:
+                  for n in sp.find_all(tag):
+                      if n.get(attr): raw.add(n.get(attr))
+              text = html.decode("utf-8", errors="replace")
+              raw.update(re.findall(r"(?:window\.open|location(?:\.href)?)\s*\(?\s*['\"]([^'\"]+)", text, re.I))
+              urls=[]
+              for item in raw:
+                  u=urljoin(base,item.replace("&amp;","&")); p=urlparse(u)
+                  if p.netloc not in {"qsrng.floir.gov","apps.fldfs.com"}: continue
+                  if any(t in u.lower() for t in ["report","result","viewer","export","excel","format=","download"]): urls.append(u)
+              return sorted(set(urls))
+
+          try:
+              html = save("01-get", s.get(URL, timeout=120))
+              html = post("02-monthly", html, {"ctl00$ContentPlaceHolder1$ddlFilingType":"2"}, target="ctl00$ContentPlaceHolder1$ddlFilingType")
+              html = post("03-year-2026", html, {"ctl00$ContentPlaceHolder1$ddlYear":"2026"}, target="ctl00$ContentPlaceHolder1$ddlYear")
+
+              period = "ctl00$ContentPlaceHolder1$lstReportingPeriod"
+              insurers = "ctl00$ContentPlaceHolder1$lstInsurers"
+              policies = "ctl00$ContentPlaceHolder1$lstPolicyType"
+              counties = "ctl00$ContentPlaceHolder1$lstCounties"
+              metrics = "ctl00$ContentPlaceHolder1$lstDataElements"
+
+              months = options(html, period+"$LeftBox")
+              march = [r["value"] for r in months if "march" in r["label"].lower()]
+              html = move("04-march-right", html, period, march[:1])
+
+              insurer_rows = options(html, insurers+"$LeftBox")
+              insurer_vals, matched = target_matches(insurer_rows)
+              result["live_insurer_option_count"] = len(insurer_rows)
+              result["target_insurer_matches"] = matched
+              (OUT/"live_insurer_options.json").write_text(json.dumps(insurer_rows, indent=2), encoding="utf-8")
+              if not insurer_vals: raise RuntimeError("none of eight target insurers are present after March selection")
+              html = move("05-target-insurers-right", html, insurers, insurer_vals)
+
+              policy_rows = options(html, policies+"$LeftBox")
+              result["policy_option_count_after_insurers"] = len(policy_rows)
+              (OUT/"live_policy_options.json").write_text(json.dumps(policy_rows, indent=2), encoding="utf-8")
+              if not policy_rows: raise RuntimeError("policy types did not populate after insurer selection")
+              html = move("06-all-policies-right", html, policies, all_items=True)
+
+              county_rows = options(html, counties+"$LeftBox")
+              result["county_option_count_after_policies"] = len(county_rows)
+              (OUT/"live_county_options.json").write_text(json.dumps(county_rows, indent=2), encoding="utf-8")
+              if not county_rows: raise RuntimeError("counties did not populate after policy selection")
+              html = move("07-all-counties-right", html, counties, all_items=True)
+
+              metric_rows = options(html, metrics+"$LeftBox")
+              metric_vals = [r["value"] for r in metric_rows if any(x in r["label"].lower() for x in ["policies in force","value of exposure","direct premium"])]
+              result["metric_options_after_counties"] = metric_rows
+              result["selected_metric_values"] = metric_vals
+              (OUT/"live_metric_options.json").write_text(json.dumps(metric_rows, indent=2), encoding="utf-8")
+              if not metric_vals: raise RuntimeError("required metrics did not populate after county selection")
+              html = move("08-required-metrics-right", html, metrics, metric_vals)
+
+              html = post("09-run-search", html, {
+                  "ctl00$ContentPlaceHolder1$radReportType":"MarketShare",
+                  "ctl00$ContentPlaceHolder1$ddlFilingType":"2",
+                  "ctl00$ContentPlaceHolder1$ddlYear":"2026",
+              }, button=("ctl00$ContentPlaceHolder1$btnSearch","Run Search"))
+              result["search_submitted"] = True
+              urls = candidate_urls(html, result["stages"][-1]["url"])
+              (OUT/"candidate_urls.json").write_text(json.dumps(urls, indent=2), encoding="utf-8")
+              for i,u in enumerate(urls[:30],1):
+                  try:
+                      r=s.get(u,timeout=180,allow_redirects=True); body=r.content; ct=r.headers.get("content-type","")
+                      ext=".xlsx" if body.startswith(b"PK\x03\x04") else (".html" if "html" in ct.lower() else ".bin")
+                      fn=f"candidate-{i:02d}{ext}"; (OUT/fn).write_bytes(body)
+                      result["candidate_downloads"].append({"requested_url":u,"final_url":r.url,"status":r.status_code,"content_type":ct,"bytes":len(body),"sha256":digest(body),"file":fn})
+                  except Exception as e:
+                      result["candidate_downloads"].append({"requested_url":u,"error":f"{type(e).__name__}: {e}"})
+          except Exception as e:
+              result["search_submitted"] = False
+              result["errors"].append({"type":type(e).__name__,"message":str(e),"traceback":traceback.format_exc()})
+          finally:
+              result["cookies"]=[{"name":c.name,"domain":c.domain,"path":c.path,"secure":c.secure,"expires":c.expires} for c in s.cookies]
+              (OUT/"cascade_summary.json").write_text(json.dumps(result, indent=2),encoding="utf-8")
+          PY
+          python /tmp/cascade.py
+          sha256sum probe/* > probe/SHA256SUMS.txt
+      - name: Upload cascade artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oir-live-export-cascade
+          path: probe/
+          if-no-files-found: error
+          retention-days: 1
