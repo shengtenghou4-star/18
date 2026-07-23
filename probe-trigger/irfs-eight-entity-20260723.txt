@@ -1,0 +1,1 @@
+One-shot read-only scan of public Florida OIR IRFS filing metadata for eight public NAIC company codes. No credentials, document requests, requester data, private source, or proprietary inputs included.
