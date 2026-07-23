@@ -1,0 +1,374 @@
+name: OIR live export probe
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'probe-trigger/**'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install parser dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests beautifulsoup4
+
+      - name: Exercise public OIR report form
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p probe
+          cat > /tmp/oir_probe.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import traceback
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          BASE = "https://qsrng.floir.gov/reports/ReportCriteria.aspx"
+          OUT = Path("probe")
+          SESSION = requests.Session()
+          SESSION.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              "Accept-Language": "en-US,en;q=0.9",
+          })
+
+          TARGETS = {
+              "14407": ["heritage", "property", "casualty"],
+              "10861": ["universal", "property", "casualty"],
+              "13563": ["american", "platinum"],
+              "12944": ["homeowners", "choice"],
+              "15885": ["typtap"],
+              "17547": ["core", "insurance"],
+              "17706": ["tailrow"],
+              "12968": ["american", "coastal"],
+          }
+
+          summary: dict = {
+              "base_url": BASE,
+              "target_naic_codes": list(TARGETS),
+              "stages": [],
+              "downloads": [],
+              "errors": [],
+          }
+
+          def sha256(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+          def safe_name(text: str) -> str:
+              return re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("_")[:120] or "file"
+
+          def selected_value(select) -> list[str]:
+              options = select.find_all("option")
+              chosen = [o.get("value", o.get_text(" ", strip=True)) for o in options if o.has_attr("selected")]
+              if not chosen and options and not select.has_attr("multiple"):
+                  chosen = [options[0].get("value", options[0].get_text(" ", strip=True))]
+              return chosen
+
+          def form_fields(html: bytes) -> list[tuple[str, str]]:
+              soup = BeautifulSoup(html, "html.parser")
+              form = soup.find("form")
+              if form is None:
+                  raise RuntimeError("No form found")
+              fields: list[tuple[str, str]] = []
+              for node in form.find_all(["input", "select", "textarea"]):
+                  name = node.get("name")
+                  if not name or node.has_attr("disabled"):
+                      continue
+                  if node.name == "input":
+                      kind = (node.get("type") or "text").lower()
+                      if kind in {"submit", "button", "image", "file", "reset"}:
+                          continue
+                      if kind in {"radio", "checkbox"} and not node.has_attr("checked"):
+                          continue
+                      fields.append((name, node.get("value", "")))
+                  elif node.name == "select":
+                      for value in selected_value(node):
+                          fields.append((name, value))
+                  else:
+                      fields.append((name, node.get_text()))
+              return fields
+
+          def inventory(html: bytes) -> dict:
+              soup = BeautifulSoup(html, "html.parser")
+              inv: dict = {"title": soup.title.get_text(" ", strip=True) if soup.title else None, "selects": {}, "forms": []}
+              for form in soup.find_all("form"):
+                  inv["forms"].append({"action": form.get("action"), "method": form.get("method"), "enctype": form.get("enctype")})
+              for select in soup.find_all("select"):
+                  name = select.get("name") or select.get("id")
+                  inv["selects"][name] = [
+                      {
+                          "value": option.get("value", option.get_text(" ", strip=True)),
+                          "label": option.get_text(" ", strip=True),
+                          "selected": option.has_attr("selected"),
+                      }
+                      for option in select.find_all("option")
+                  ]
+              inv["validation_messages"] = [
+                  node.get_text(" ", strip=True)
+                  for node in soup.find_all(id=re.compile(r"Validator|Validation|lblMessage|lblError", re.I))
+                  if node.get_text(" ", strip=True)
+              ]
+              return inv
+
+          def save_response(stage: str, response: requests.Response) -> bytes:
+              body = response.content
+              stem = safe_name(stage)
+              content_type = response.headers.get("content-type", "")
+              suffix = ".html" if "html" in content_type.lower() else ".bin"
+              path = OUT / f"{stem}{suffix}"
+              path.write_bytes(body)
+              (OUT / f"{stem}.headers.json").write_text(json.dumps(dict(response.headers), indent=2), encoding="utf-8")
+              record = {
+                  "stage": stage,
+                  "status": response.status_code,
+                  "url": response.url,
+                  "content_type": content_type,
+                  "bytes": len(body),
+                  "sha256": sha256(body),
+                  "file": path.name,
+              }
+              if "html" in content_type.lower() or body.lstrip().startswith(b"<"):
+                  try:
+                      inv = inventory(body)
+                      inv_path = OUT / f"{stem}.inventory.json"
+                      inv_path.write_text(json.dumps(inv, indent=2), encoding="utf-8")
+                      record["inventory_file"] = inv_path.name
+                  except Exception as exc:
+                      record["inventory_error"] = f"{type(exc).__name__}: {exc}"
+              summary["stages"].append(record)
+              response.raise_for_status()
+              return body
+
+          def replace_fields(fields: list[tuple[str, str]], updates: dict[str, str | list[str]]) -> list[tuple[str, str]]:
+              remove = set(updates) | {"__EVENTTARGET", "__EVENTARGUMENT"}
+              result = [(k, v) for k, v in fields if k not in remove]
+              for key, value in updates.items():
+                  values = value if isinstance(value, list) else [value]
+                  result.extend((key, str(item)) for item in values)
+              return result
+
+          def post(stage: str, html: bytes, updates: dict[str, str | list[str]], *, event_target: str = "", submit: tuple[str, str] | None = None) -> bytes:
+              fields = replace_fields(form_fields(html), updates)
+              fields.append(("__EVENTTARGET", event_target))
+              fields.append(("__EVENTARGUMENT", ""))
+              if submit is not None:
+                  fields.append(submit)
+              multipart = [(key, (None, value)) for key, value in fields]
+              response = SESSION.post(BASE, files=multipart, timeout=120, allow_redirects=True)
+              return save_response(stage, response)
+
+          def options(html: bytes, control: str) -> list[dict[str, str]]:
+              soup = BeautifulSoup(html, "html.parser")
+              select = soup.find("select", attrs={"name": control})
+              if select is None:
+                  return []
+              return [
+                  {"value": option.get("value", option.get_text(" ", strip=True)), "label": option.get_text(" ", strip=True)}
+                  for option in select.find_all("option")
+              ]
+
+          def move_selected(stage: str, html: bytes, base_control: str, values: list[str]) -> bytes:
+              if not values:
+                  raise RuntimeError(f"No values selected for {base_control}")
+              return post(
+                  stage,
+                  html,
+                  {f"{base_control}$LeftBox": values},
+                  submit=(f"{base_control}$MoveRight", ">"),
+              )
+
+          def move_all(stage: str, html: bytes, base_control: str) -> bytes:
+              return post(stage, html, {}, submit=(f"{base_control}$MoveAllRight", ">>"))
+
+          def find_march(rows: list[dict[str, str]]) -> list[str]:
+              exact = []
+              fallback = []
+              for row in rows:
+                  label = row["label"].lower()
+                  if "march" in label or ("03/01/2026" in label and "03/31/2026" in label):
+                      exact.append(row["value"])
+                  elif "03/" in label or "2026m3" in label.replace(" ", ""):
+                      fallback.append(row["value"])
+              return exact or fallback[:1]
+
+          def find_insurers(rows: list[dict[str, str]]) -> tuple[list[str], dict[str, dict | None]]:
+              chosen: list[str] = []
+              matches: dict[str, dict | None] = {}
+              for code, fragments in TARGETS.items():
+                  hit = None
+                  for row in rows:
+                      label = row["label"].lower()
+                      normalized = re.sub(r"[^a-z0-9]+", " ", label)
+                      if code in normalized or all(fragment in normalized for fragment in fragments):
+                          hit = row
+                          break
+                  matches[code] = hit
+                  if hit is not None and hit["value"] not in chosen:
+                      chosen.append(hit["value"])
+              return chosen, matches
+
+          def find_metrics(rows: list[dict[str, str]]) -> list[str]:
+              selected = []
+              for row in rows:
+                  label = row["label"].lower()
+                  wanted = (
+                      "policies in force" in label
+                      or "value of exposure" in label
+                      or "direct premium" in label
+                  )
+                  if wanted and row["value"] not in selected:
+                      selected.append(row["value"])
+              return selected
+
+          def fetch_candidates(html: bytes, base_url: str) -> None:
+              soup = BeautifulSoup(html, "html.parser")
+              raw: set[str] = set()
+              for tag, attr in [("a", "href"), ("iframe", "src"), ("frame", "src"), ("form", "action"), ("script", "src")]:
+                  for node in soup.find_all(tag):
+                      value = node.get(attr)
+                      if value:
+                          raw.add(value)
+              text = html.decode("utf-8", errors="replace")
+              raw.update(re.findall(r"(?:window\.open|location(?:\.href)?)\s*\(?\s*['\"]([^'\"]+)", text, re.I))
+              raw.update(re.findall(r"https?://[^\s'\"<>]+", text, re.I))
+              candidates = []
+              for item in sorted(raw):
+                  absolute = urljoin(base_url, item.replace("&amp;", "&"))
+                  parsed = urlparse(absolute)
+                  if parsed.scheme not in {"http", "https"}:
+                      continue
+                  if parsed.netloc not in {"qsrng.floir.gov", "apps.fldfs.com"}:
+                      continue
+                  lower = absolute.lower()
+                  if not any(token in lower for token in ["report", "result", "viewer", "export", "excel", "format=", "handler", "download"]):
+                      continue
+                  candidates.append(absolute)
+              (OUT / "candidate_urls.json").write_text(json.dumps(candidates, indent=2), encoding="utf-8")
+              for index, url in enumerate(candidates[:30], start=1):
+                  try:
+                      response = SESSION.get(url, timeout=120, allow_redirects=True)
+                      body = response.content
+                      content_type = response.headers.get("content-type", "")
+                      ext = ".xlsx" if body.startswith(b"PK\x03\x04") else (".html" if "html" in content_type.lower() else ".bin")
+                      path = OUT / f"candidate-{index:02d}{ext}"
+                      path.write_bytes(body)
+                      summary["downloads"].append({
+                          "requested_url": url,
+                          "final_url": response.url,
+                          "status": response.status_code,
+                          "content_type": content_type,
+                          "bytes": len(body),
+                          "sha256": sha256(body),
+                          "file": path.name,
+                      })
+                  except Exception as exc:
+                      summary["downloads"].append({"requested_url": url, "error": f"{type(exc).__name__}: {exc}"})
+
+          try:
+              initial_response = SESSION.get(BASE, timeout=120)
+              html = save_response("01-initial-get", initial_response)
+
+              html = post(
+                  "02-select-monthly",
+                  html,
+                  {"ctl00$ContentPlaceHolder1$ddlFilingType": "2"},
+                  event_target="ctl00$ContentPlaceHolder1$ddlFilingType",
+              )
+              html = post(
+                  "03-select-2026",
+                  html,
+                  {"ctl00$ContentPlaceHolder1$ddlYear": "2026"},
+                  event_target="ctl00$ContentPlaceHolder1$ddlYear",
+              )
+
+              period_base = "ctl00$ContentPlaceHolder1$lstReportingPeriod"
+              insurer_base = "ctl00$ContentPlaceHolder1$lstInsurers"
+              policy_base = "ctl00$ContentPlaceHolder1$lstPolicyType"
+              county_base = "ctl00$ContentPlaceHolder1$lstCounties"
+              metric_base = "ctl00$ContentPlaceHolder1$lstDataElements"
+
+              period_rows = options(html, period_base + "$LeftBox")
+              insurer_rows = options(html, insurer_base + "$LeftBox")
+              policy_rows = options(html, policy_base + "$LeftBox")
+              county_rows = options(html, county_base + "$LeftBox")
+              metric_rows = options(html, metric_base + "$LeftBox")
+
+              march_values = find_march(period_rows)
+              insurer_values, insurer_matches = find_insurers(insurer_rows)
+              metric_values = find_metrics(metric_rows)
+              selection = {
+                  "period_options": period_rows,
+                  "march_values": march_values,
+                  "insurer_option_count": len(insurer_rows),
+                  "insurer_matches": insurer_matches,
+                  "selected_insurer_values": insurer_values,
+                  "policy_option_count": len(policy_rows),
+                  "county_option_count": len(county_rows),
+                  "metric_options": metric_rows,
+                  "selected_metric_values": metric_values,
+              }
+              (OUT / "selection_plan.json").write_text(json.dumps(selection, indent=2), encoding="utf-8")
+
+              if not march_values:
+                  raise RuntimeError("March 2026 reporting period not found")
+              if len(insurer_values) != len(TARGETS):
+                  missing = [code for code, match in insurer_matches.items() if match is None]
+                  raise RuntimeError(f"Target insurers missing from live options: {missing}")
+              if not policy_rows or not county_rows or not metric_values:
+                  raise RuntimeError("One or more required dynamic option sets are empty")
+
+              html = move_selected("04-move-march", html, period_base, march_values[:1])
+              html = move_selected("05-move-eight-insurers", html, insurer_base, insurer_values)
+              html = move_all("06-move-all-policy-types", html, policy_base)
+              html = move_all("07-move-all-counties", html, county_base)
+              html = move_selected("08-move-required-metrics", html, metric_base, metric_values)
+
+              html = post(
+                  "09-run-search",
+                  html,
+                  {
+                      "ctl00$ContentPlaceHolder1$radReportType": "MarketShare",
+                      "ctl00$ContentPlaceHolder1$ddlFilingType": "2",
+                      "ctl00$ContentPlaceHolder1$ddlYear": "2026",
+                  },
+                  submit=("ctl00$ContentPlaceHolder1$btnSearch", "Run Search"),
+              )
+              fetch_candidates(html, summary["stages"][-1]["url"])
+              summary["completed_search_submission"] = True
+          except Exception as exc:
+              summary["completed_search_submission"] = False
+              summary["errors"].append({
+                  "type": type(exc).__name__,
+                  "message": str(exc),
+                  "traceback": traceback.format_exc(),
+              })
+          finally:
+              summary["cookies"] = [
+                  {"name": cookie.name, "domain": cookie.domain, "path": cookie.path, "secure": cookie.secure, "expires": cookie.expires}
+                  for cookie in SESSION.cookies
+              ]
+              (OUT / "probe_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+          PY
+          python /tmp/oir_probe.py
+          sha256sum probe/* > probe/SHA256SUMS.txt
+
+      - name: Upload public probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oir-live-export-probe
+          path: probe/
+          if-no-files-found: error
+          retention-days: 1
