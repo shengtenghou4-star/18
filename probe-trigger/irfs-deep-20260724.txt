@@ -1,1 +1,0 @@
-One-shot public IRFS metadata expansion. No document requests, requester identity, CAPTCHA, credentials, or private project source.
