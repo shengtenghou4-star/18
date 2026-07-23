@@ -1,0 +1,139 @@
+name: OIR Excel download
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'probe-trigger/excel-*'
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - run: python -m pip install --disable-pip-version-check --quiet requests beautifulsoup4
+      - name: Submit March 2026 report and download Excel
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > /tmp/download.py <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, time, traceback
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          CRITERIA = "https://qsrng.floir.gov/reports/ReportCriteria.aspx"
+          VIEWER = "https://qsrng.floir.gov/reports/ReportViewer.aspx"
+          OUT = Path("evidence")
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36",
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          })
+          summary = {"criteria_url": CRITERIA, "viewer_url": VIEWER, "stages": [], "exports": [], "errors": []}
+
+          def sha(b): return hashlib.sha256(b).hexdigest()
+          def bs(html): return BeautifulSoup(html, "html.parser")
+
+          def form_fields(html):
+              form = bs(html).find("form")
+              if form is None: raise RuntimeError("form missing")
+              fields=[]
+              for n in form.find_all(["input","select","textarea"]):
+                  name=n.get("name")
+                  if not name or n.has_attr("disabled"): continue
+                  if n.name=="input":
+                      typ=(n.get("type") or "text").lower()
+                      if typ in {"submit","button","image","file","reset"}: continue
+                      if typ in {"radio","checkbox"} and not n.has_attr("checked"): continue
+                      fields.append((name,n.get("value","")))
+                  elif n.name=="select":
+                      opts=n.find_all("option"); chosen=[o for o in opts if o.has_attr("selected")]
+                      if not chosen and opts and not n.has_attr("multiple"): chosen=[opts[0]]
+                      fields.extend((name,o.get("value",o.get_text(" ",strip=True))) for o in chosen)
+                  else: fields.append((name,n.get_text()))
+              return fields
+
+          def save(stage, response, preferred_ext=None):
+              body=response.content; ct=response.headers.get("content-type","")
+              ext=preferred_ext or (".xlsx" if body.startswith(b"PK\x03\x04") else (".html" if "html" in ct.lower() or body.lstrip().startswith(b"<") else ".bin"))
+              name=re.sub(r"[^A-Za-z0-9._-]+","_",stage).strip("_")+ext
+              (OUT/name).write_bytes(body)
+              (OUT/(name+".headers.json")).write_text(json.dumps(dict(response.headers),indent=2),encoding="utf-8")
+              rec={"stage":stage,"status":response.status_code,"url":response.url,"content_type":ct,"bytes":len(body),"sha256":sha(body),"file":name}
+              summary["stages"].append(rec); response.raise_for_status(); return body
+
+          def post(stage, html, updates=None, target="", button=None):
+              updates=updates or {}; fields=form_fields(html)
+              remove=set(updates)|{"__EVENTTARGET","__EVENTARGUMENT"}
+              fields=[(k,v) for k,v in fields if k not in remove]
+              for k,v in updates.items():
+                  vals=v if isinstance(v,list) else [v]
+                  fields.extend((k,str(x)) for x in vals)
+              fields.extend([("__EVENTTARGET",target),("__EVENTARGUMENT","")])
+              if button: fields.append(button)
+              r=session.post(CRITERIA,files=[(k,(None,v)) for k,v in fields],timeout=180,allow_redirects=True)
+              return save(stage,r)
+
+          def move(stage, html, base, values=None, all_items=False):
+              if all_items: return post(stage,html,button=(base+"$MoveAllRight",">>"))
+              return post(stage,html,{base+"$LeftBox":values},button=(base+"$MoveRight",">"))
+
+          try:
+              html=save("01-get",session.get(CRITERIA,timeout=120))
+              html=post("02-monthly",html,{"ctl00$ContentPlaceHolder1$ddlFilingType":"2"},target="ctl00$ContentPlaceHolder1$ddlFilingType")
+              html=post("03-year",html,{"ctl00$ContentPlaceHolder1$ddlYear":"2026"},target="ctl00$ContentPlaceHolder1$ddlYear")
+              html=move("04-march",html,"ctl00$ContentPlaceHolder1$lstReportingPeriod",["706"])
+              html=move("05-eight-insurers",html,"ctl00$ContentPlaceHolder1$lstInsurers",["202847","104219","201909","201559","203626","101991","205614","201598"])
+              html=move("06-all-policies",html,"ctl00$ContentPlaceHolder1$lstPolicyType",all_items=True)
+              html=move("07-all-counties",html,"ctl00$ContentPlaceHolder1$lstCounties",all_items=True)
+              html=move("08-metrics",html,"ctl00$ContentPlaceHolder1$lstDataElements",["9","10","1","3","4","12","13","11"])
+              html=post("09-search",html,{"ctl00$ContentPlaceHolder1$radReportType":"MarketShare","ctl00$ContentPlaceHolder1$ddlFilingType":"2","ctl00$ContentPlaceHolder1$ddlYear":"2026"},button=("ctl00$ContentPlaceHolder1$btnSearch","Run Search"))
+
+              viewer_response=session.get(VIEWER,timeout=180,allow_redirects=True)
+              viewer=save("10-viewer",viewer_response)
+              text=viewer.decode("utf-8",errors="replace")
+              match=re.search(r'ExportUrlBase":"([^"]+)',text)
+              if not match: raise RuntimeError("ExportUrlBase not found in viewer")
+              export_base=match.group(1).replace("\\u0026","&").replace("\\/","/")
+              export_url=urljoin(VIEWER,export_base+"EXCELOPENXML")
+              csv_url=urljoin(VIEWER,export_base+"CSV")
+              summary["export_url_template_sha256"]=sha(export_base.encode())
+              summary["report_session_present"]="ReportSession=" in export_base
+              summary["control_id_present"]="ControlID=" in export_base
+
+              for attempt in range(1,5):
+                  r=session.get(export_url,timeout=300,allow_redirects=True)
+                  body=r.content; ct=r.headers.get("content-type","")
+                  fn=f"march-2026-eight-insurers-attempt-{attempt}"+(".xlsx" if body.startswith(b"PK\x03\x04") else ".bin")
+                  (OUT/fn).write_bytes(body)
+                  summary["exports"].append({"format":"EXCELOPENXML","attempt":attempt,"status":r.status_code,"final_url":r.url,"content_type":ct,"bytes":len(body),"sha256":sha(body),"file":fn,"is_zip_container":body.startswith(b"PK\x03\x04")})
+                  if r.status_code==200 and body.startswith(b"PK\x03\x04"): break
+                  time.sleep(5)
+
+              r=session.get(csv_url,timeout=300,allow_redirects=True)
+              body=r.content; fn="march-2026-eight-insurers.csv" if b"," in body[:4096] else "march-2026-eight-insurers-csv-response.bin"
+              (OUT/fn).write_bytes(body)
+              summary["exports"].append({"format":"CSV","status":r.status_code,"final_url":r.url,"content_type":r.headers.get("content-type",""),"bytes":len(body),"sha256":sha(body),"file":fn})
+          except Exception as exc:
+              summary["errors"].append({"type":type(exc).__name__,"message":str(exc),"traceback":traceback.format_exc()})
+          finally:
+              summary["cookie_names"]=[c.name for c in session.cookies]
+              (OUT/"download_summary.json").write_text(json.dumps(summary,indent=2),encoding="utf-8")
+          PY
+          python /tmp/download.py
+          sha256sum evidence/* > evidence/SHA256SUMS.txt
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oir-march-2026-excel
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 1
