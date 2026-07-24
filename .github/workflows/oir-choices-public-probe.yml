@@ -1,4 +1,4 @@
-name: OIR CHOICES public probe
+name: OIR CHOICES public acquisition
 
 on:
   pull_request:
@@ -10,126 +10,163 @@ permissions:
   contents: read
 
 jobs:
-  probe:
+  acquire:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
-      - name: Fetch public CHOICES page and static assets
+      - name: Acquire public county and target-company rate matrices
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p out/assets
+          mkdir -p out/raw/counties out/raw/companies
           python - <<'PY'
-          import hashlib, json, re, ssl, urllib.parse, urllib.request
-          from html.parser import HTMLParser
+          import csv, hashlib, json, re, ssl, time, urllib.parse, urllib.request
           from pathlib import Path
 
-          BASE = 'https://choices.floir.gov/pandc/homeowners'
+          ROOT = 'https://choices.floir.gov'
           OUT = Path('out')
           ctx = ssl.create_default_context()
-          headers = {'User-Agent': 'StormPrice-public-source-audit/0.30 (+public metadata only)'}
-
-          def fetch(url):
-              req = urllib.request.Request(url, headers=headers)
-              with urllib.request.urlopen(req, timeout=60, context=ctx) as r:
-                  body = r.read()
-                  meta = {
-                      'url': r.geturl(),
-                      'status': getattr(r, 'status', None),
-                      'content_type': r.headers.get('Content-Type'),
-                      'bytes': len(body),
-                      'sha256': hashlib.sha256(body).hexdigest(),
-                  }
-                  return body, meta
-
-          page, page_meta = fetch(BASE)
-          (OUT/'homeowners.html').write_bytes(page)
-          text = page.decode('utf-8', 'replace')
-
-          class P(HTMLParser):
-              def __init__(self):
-                  super().__init__(); self.scripts=[]; self.links=[]
-              def handle_starttag(self, tag, attrs):
-                  d=dict(attrs)
-                  if tag=='script' and d.get('src'): self.scripts.append(d['src'])
-                  if tag=='link' and d.get('href'): self.links.append(d['href'])
-          p=P(); p.feed(text)
-
-          assets=[]
-          for idx, src in enumerate(p.scripts):
-              url=urllib.parse.urljoin(BASE, src)
-              try:
-                  body, meta=fetch(url)
-                  suffix=Path(urllib.parse.urlparse(url).path).suffix or '.js'
-                  path=OUT/'assets'/f'{idx:02d}{suffix}'
-                  path.write_bytes(body)
-                  meta['local_path']=str(path)
-                  assets.append(meta)
-              except Exception as e:
-                  assets.append({'url':url,'error':repr(e)})
-
-          corpus = text + '\n' + '\n'.join(
-              Path(a['local_path']).read_text('utf-8','replace')
-              for a in assets if a.get('local_path')
-          )
-          patterns = {
-              'absolute_urls': r'https?://[^\"\'\s<>]+',
-              'root_paths': r'[\"\'](/(?:api|pandc|homeowners|Homeowners|Rate|rate|County|county|Company|company|Export|export)[^\"\']*)[\"\']',
-              'ajax_urls': r'(?:url|route|endpoint)\s*[:=]\s*[\"\']([^\"\']+)[\"\']',
-              'fetch_calls': r'fetch\s*\(\s*[\"\']([^\"\']+)[\"\']',
-              'controller_actions': r'[\"\'](/[^\"\']*(?:Get|Search|Export|Rates|Companies|Counties|Examples)[^\"\']*)[\"\']',
+          headers = {'User-Agent': 'StormPrice-public-source-audit/0.30 (+public OIR CHOICES data)'}
+          targets = {
+              'HRTG-HPCIC': ['HERITAGE PROPERTY', 'HERITAGE PROPERTY & CASUALTY'],
+              'UVE-UPCIC': ['UNIVERSAL PROPERTY', 'UNIVERSAL PROPERTY & CASUALTY'],
+              'UVE-APPCIC': ['AMERICAN PLATINUM'],
+              'HCI-HCPCI': ['HOMEOWNERS CHOICE', 'HOMEOWNERS CHOICE PROPERTY'],
+              'HCI-TYPTAP': ['TYPTAP'],
+              'HCI-CORE': ['CONDO OWNERS RECIPROCAL', 'CORE'],
+              'HCI-TAILROW': ['TAILROW'],
+              'ACIC-AMCOASTAL': ['AMERICAN COASTAL'],
           }
-          discoveries={}
-          for name, pat in patterns.items():
-              vals=[]
-              for m in re.finditer(pat, corpus, re.I):
-                  v=m.group(1) if m.lastindex else m.group(0)
-                  if v not in vals: vals.append(v)
-              discoveries[name]=vals[:500]
+          request_log=[]
 
-          keywords=['homeowner','county','company','example','rate','premium','export','ajax','api']
-          excerpts=[]
-          for source_name, source_text in [('homeowners.html', text)] + [
-              (a['local_path'], Path(a['local_path']).read_text('utf-8','replace'))
-              for a in assets if a.get('local_path')
-          ]:
-              low=source_text.lower()
-              for kw in keywords:
-                  start=0
-                  for _ in range(12):
-                      i=low.find(kw,start)
-                      if i<0: break
-                      excerpts.append({'source':source_name,'keyword':kw,'excerpt':source_text[max(0,i-220):i+420]})
-                      start=i+len(kw)
+          def fetch_json(path, params=None, attempts=3):
+              url = urllib.parse.urljoin(ROOT, path)
+              if params:
+                  url += ('&' if '?' in url else '?') + urllib.parse.urlencode(params)
+              last=None
+              for attempt in range(1, attempts+1):
+                  try:
+                      req=urllib.request.Request(url, headers=headers)
+                      with urllib.request.urlopen(req, timeout=60, context=ctx) as r:
+                          body=r.read()
+                          meta={'url':r.geturl(),'status':getattr(r,'status',None),'content_type':r.headers.get('Content-Type'),'bytes':len(body),'sha256':hashlib.sha256(body).hexdigest(),'attempt':attempt}
+                          request_log.append(meta)
+                          return json.loads(body.decode('utf-8-sig')), body, meta
+                  except Exception as e:
+                      last=e
+                      request_log.append({'url':url,'attempt':attempt,'error':repr(e)})
+                      time.sleep(attempt)
+              raise RuntimeError(f'failed {url}: {last!r}')
 
+          def safe(value):
+              return re.sub(r'[^A-Za-z0-9_.-]+','_',str(value)).strip('_') or 'blank'
+
+          def norm(value):
+              return re.sub(r'[^A-Z0-9]+',' ',str(value).upper()).strip()
+
+          def write_json(path, obj):
+              path.parent.mkdir(parents=True,exist_ok=True)
+              path.write_text(json.dumps(obj,indent=2,sort_keys=True),encoding='utf-8')
+
+          init, init_body, init_meta = fetch_json('/PandC/Data/Init?iId=2')
+          (OUT/'raw'/'init.json').write_bytes(init_body)
+          examples=init.get('Examples') or []
+          counties=init.get('Counties') or []
+          write_json(OUT/'init_summary.json', {'examples':examples,'counties':counties,'meta':init_meta})
+
+          all_county_rows=[]
+          all_company_rows=[]
+          company_catalog=[]
+          target_matches=[]
+          errors=[]
+
+          for ex in examples:
+              eid=ex.get('Id')
+              ex_name=ex.get('DisplayName') or ex.get('Name') or str(eid)
+              companies, body, meta = fetch_json('/PandC/Data/Companies?iId=2', {'eId':eid})
+              (OUT/'raw'/'companies'/f'example_{safe(eid)}.json').write_bytes(body)
+              for company in companies or []:
+                  row={'example_id':eid,'example_name':ex_name,**company}
+                  company_catalog.append(row)
+                  cname=norm(company.get('Name'))
+                  matched=[]
+                  for insurer_id, needles in targets.items():
+                      if any(norm(n) in cname for n in needles): matched.append(insurer_id)
+                  if matched:
+                      target_matches.append({'example_id':eid,'example_name':ex_name,'company':company,'insurer_ids':matched})
+                      try:
+                          rates, rb, rm = fetch_json('/PandC/Data/CompanyRates?iId=2', {'eId':eid,'company':company.get('Id')})
+                          (OUT/'raw'/'companies'/f'example_{safe(eid)}_company_{safe(company.get("Id"))}.json').write_bytes(rb)
+                          for rate in rates.get('Rates') or []:
+                              all_company_rows.append({'example_id':eid,'example_name':ex_name,'company_id':company.get('Id'),'company_name':company.get('Name'),'rate_column':rates.get('RateColumn'),'rate2_column':rates.get('Rate2Column'),**rate})
+                      except Exception as e:
+                          errors.append({'scope':'company_rates','example_id':eid,'company':company,'error':repr(e)})
+                      time.sleep(0.05)
+
+              for county in counties:
+                  county_name=county.get('Name') if isinstance(county,dict) else county
+                  try:
+                      rates, rb, rm = fetch_json('/PandC/Data/CountyRates?iId=2', {'eId':eid,'county':county_name})
+                      (OUT/'raw'/'counties'/f'example_{safe(eid)}_county_{safe(county_name)}.json').write_bytes(rb)
+                      for rate in rates.get('Rates') or []:
+                          all_county_rows.append({'example_id':eid,'example_name':ex_name,'query_county':county_name,'rate_column':rates.get('RateColumn'),'rate2_column':rates.get('Rate2Column'),**rate})
+                  except Exception as e:
+                      errors.append({'scope':'county_rates','example_id':eid,'county':county_name,'error':repr(e)})
+                  time.sleep(0.05)
+
+          def write_csv(path, rows):
+              keys=[]
+              for row in rows:
+                  for k in row:
+                      if k not in keys: keys.append(k)
+              with path.open('w',newline='',encoding='utf-8') as f:
+                  w=csv.DictWriter(f,fieldnames=keys,extrasaction='ignore')
+                  w.writeheader()
+                  for row in rows: w.writerow(row)
+
+          write_csv(OUT/'company_catalog.csv', company_catalog)
+          write_csv(OUT/'county_rate_matrix.csv', all_county_rows)
+          write_csv(OUT/'target_company_rate_matrix.csv', all_company_rows)
+          write_json(OUT/'target_company_matches.json', target_matches)
+          write_json(OUT/'request_log.json', request_log)
+          write_json(OUT/'errors.json', errors)
+
+          matched_ids=sorted({i for m in target_matches for i in m['insurer_ids']})
           report={
-              'base_url':BASE,
-              'page':page_meta,
-              'script_sources':p.scripts,
-              'link_sources':p.links,
-              'assets':assets,
-              'discoveries':discoveries,
-              'excerpts':excerpts[:300],
+              'source':'Florida OIR CHOICES Homeowners Rate Comparison Tool',
+              'source_url':'https://choices.floir.gov/pandc/homeowners',
+              'examples':len(examples),
+              'counties':len(counties),
+              'company_catalog_rows':len(company_catalog),
+              'county_rate_rows':len(all_county_rows),
+              'target_company_rate_rows':len(all_company_rows),
+              'target_entities_matched':matched_ids,
+              'target_entities_unmatched':sorted(set(targets)-set(matched_ids)),
+              'target_match_records':len(target_matches),
+              'request_count':len([x for x in request_log if 'status' in x]),
+              'errors':len(errors),
+              'claim_boundary':'CHOICES rates are illustrative sample average premiums from recent approved filings. They are not policy counts, exposure, direct written premium, availability, quotes, or March 2026 county/ZIP exposure.',
               'boundaries':{
+                  'public_get_only':True,
                   'authenticated':False,
                   'captcha':False,
                   'requester_identity':False,
                   'private_project_source':False,
                   'irfs_request_endpoints_called':False,
-                  'choices_public_page_only':True,
+                  'document_requests_submitted':False,
               },
           }
-          (OUT/'report.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
+          write_json(OUT/'report.json',report)
           with (OUT/'SHA256SUMS.txt').open('w') as f:
               for path in sorted(OUT.rglob('*')):
                   if path.is_file() and path.name!='SHA256SUMS.txt':
                       f.write(hashlib.sha256(path.read_bytes()).hexdigest()+'  '+str(path.relative_to(OUT))+'\n')
-          print(json.dumps({'page':page_meta,'scripts':len(p.scripts),'assets_ok':sum('local_path' in a for a in assets),'discoveries':{k:len(v) for k,v in discoveries.items()}},indent=2))
+          print(json.dumps(report,indent=2))
           PY
       - name: Upload public-source artifact
         uses: actions/upload-artifact@v4
         with:
-          name: oir-choices-public-probe
+          name: oir-choices-public-acquisition
           path: out
           retention-days: 1
           if-no-files-found: error
